@@ -11,9 +11,14 @@ services:
       # float32 已满足 1e-6 对照要求；如需更高精度可改为 float64
       MODEL_DTYPE: float32
       TORCH_NUM_THREADS: "1"
+      # 留证归档目录（容器内）与回执保留张数
+      ARCHIVE_DIR: /app/archive
+      RECEIPT_KEEP: "32"
     volumes:
       # 旧检查点只读进入，新版本写到单独的可写目录
       - ./checkpoints:/app/checkpoints
+      # 留证归档（回执 + 模型状态）持久化，重启后可凭号复算
+      - ./archive:/app/archive
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]

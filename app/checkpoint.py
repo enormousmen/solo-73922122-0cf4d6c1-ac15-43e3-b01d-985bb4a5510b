@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import tempfile
 from dataclasses import dataclass
@@ -57,12 +59,57 @@ _DTYPE_MAP = {
 }
 
 
-def _resolve_dtype(name: str | None) -> torch.dtype:
+def resolve_dtype(name: str | None) -> torch.dtype:
     if name is None:
         return torch.float32
     if name not in _DTYPE_MAP:
         raise ValueError(f"不支持的 dtype: {name}")
     return _DTYPE_MAP[name]
+
+
+@dataclass
+class ModelSnapshot:
+    """某一时刻的推理状态快照：权重 + 列顺序 + 推理精度。
+
+    留证时在持锁状态下克隆生成；之后的推理与归档都基于这份
+    不可变副本，续训/扩列/重载不影响已取齐的快照。
+    """
+
+    model_state: dict[str, torch.Tensor]
+    feature_names: list[str]
+    hidden_dim: int
+    num_classes: int
+    dtype: torch.dtype
+
+    def archived_state_dict(self) -> dict[str, Any]:
+        """转成可 torch.save 的归档字典（仅推理所需内容）。"""
+        return {
+            "model_state": {k: v.detach().cpu() for k, v in self.model_state.items()},
+            "feature_names": list(self.feature_names),
+            "hidden_dim": self.hidden_dim,
+            "num_classes": self.num_classes,
+            "dtype": str(self.dtype).replace("torch.", ""),
+        }
+
+
+def snapshot_fingerprint(snapshot: ModelSnapshot) -> str:
+    """对快照内容求 SHA-256 指纹。
+
+    相同权重、相同列顺序、相同精度 -> 相同指纹，因此多张回执
+    共用的模型状态只归档一份（按指纹命名状态文件）。
+    """
+    h = hashlib.sha256()
+    h.update(str(snapshot.dtype).encode("utf-8"))
+    h.update(b"|")
+    h.update(json.dumps(list(snapshot.feature_names)).encode("utf-8"))
+    h.update(b"|")
+    h.update(f"{snapshot.hidden_dim}:{snapshot.num_classes}".encode("utf-8"))
+    for key in sorted(snapshot.model_state):
+        tensor = snapshot.model_state[key].detach().cpu().contiguous()
+        h.update(b"|")
+        h.update(key.encode("utf-8"))
+        h.update(tensor.numpy().tobytes())
+    return h.hexdigest()
 
 
 def load_checkpoint(path: str, dtype: torch.dtype | None = None) -> CheckpointBundle:
@@ -72,7 +119,7 @@ def load_checkpoint(path: str, dtype: torch.dtype | None = None) -> CheckpointBu
     # weights_only=False：检查点内为我们自己写入的张量与基础容器
     blob = torch.load(path, map_location="cpu", weights_only=False)
 
-    ckpt_dtype = _resolve_dtype(blob.get("dtype"))
+    ckpt_dtype = resolve_dtype(blob.get("dtype"))
     dtype = dtype or ckpt_dtype
     feature_names = list(blob["feature_names"])
     hidden_dim = int(blob["hidden_dim"])

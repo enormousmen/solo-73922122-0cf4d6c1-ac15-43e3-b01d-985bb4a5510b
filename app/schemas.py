@@ -72,5 +72,51 @@ class ReloadResponse(BaseModel):
     optimizer_step: int
 
 
+class AttestedPredictResponse(BaseModel):
+    # 留证预测：分类结果 + 回执号（凭号可复算）
+    receipt_id: str
+    feature_names: list[str]
+    predictions: list[PredictedItem]
+
+
+class ReplayResponse(BaseModel):
+    # 凭号复算：用归档的权重/列顺序/精度/原始读数重新推理并与首次对照
+    receipt_id: str
+    state_id: str
+    feature_names: list[str]
+    dtype: str
+    predictions: list[PredictedItem]  # 本次复算结果
+    first_predictions: list[PredictedItem]  # 留证时的首次结果
+    max_probability_diff: float  # 各类概率与首次的最大绝对差
+    labels_match: bool
+    zero_filled_match: bool
+
+
+class ReceiptSummary(BaseModel):
+    receipt_id: str
+    seq: int
+    state_id: str
+    created_at: str
+    dtype: str
+    num_instances: int
+
+
+class ReceiptListResponse(BaseModel):
+    keep: int
+    count: int
+    receipts: list[ReceiptSummary]
+
+
+class ReceiptDetailResponse(BaseModel):
+    receipt_id: str
+    seq: int
+    state_id: str
+    created_at: str
+    dtype: str
+    feature_names: list[str]
+    instances: list[dict[str, float]]
+    predictions: list[PredictedItem]
+
+
 class ErrorMessage(BaseModel):
     detail: Any

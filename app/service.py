@@ -14,11 +14,39 @@ import torch
 
 from .checkpoint import (
     CheckpointBundle,
+    ModelSnapshot,
     expand_bundle,
     load_checkpoint,
     save_checkpoint_atomic,
 )
 from .data import align_labels, align_rows
+
+
+@torch.no_grad()
+def predict_with(
+    model: torch.nn.Module,
+    feature_names: list[str],
+    dtype: torch.dtype,
+    instances: list[dict],
+) -> list[dict]:
+    """对一批样本推理，返回标签/各类概率/补零列。
+
+    在线预测、留证首次推理与凭号复算共用同一条推理路径，
+    保证相同状态 + 相同读数得到逐位相同的结果。
+    """
+    x, missing = align_rows(instances, feature_names, dtype)
+    logits = model(x)
+    probs = torch.softmax(logits, dim=1)
+    labels = torch.argmax(probs, dim=1)
+    return [
+        {
+            "label": int(labels[i]),
+            "score": float(probs[i, labels[i]]),
+            "probabilities": [float(p) for p in probs[i]],
+            "zero_filled_columns": missing[i],
+        }
+        for i in range(len(instances))
+    ]
 
 
 class ModelService:
@@ -48,22 +76,25 @@ class ModelService:
         }
 
     # ---- 预测 -----------------------------------------------------
-    @torch.no_grad()
     def predict(self, instances: list[dict]) -> list[dict]:
         b = self._bundle
-        x, missing = align_rows(instances, b.feature_names, b.dtype)
-        logits = b.model(x)
-        probs = torch.softmax(logits, dim=1)
-        labels = torch.argmax(probs, dim=1)
-        return [
-            {
-                "label": int(labels[i]),
-                "score": float(probs[i, labels[i]]),
-                "probabilities": [float(p) for p in probs[i]],
-                "zero_filled_columns": missing[i],
-            }
-            for i in range(len(instances))
-        ]
+        return predict_with(b.model, b.feature_names, b.dtype, instances)
+
+    # ---- 留证快照（须在持锁状态下调用） ---------------------------
+    def snapshot(self) -> ModelSnapshot:
+        """克隆当前推理状态（权重/列顺序/精度）的不可变副本。
+
+        快照取齐后即可释放锁：后续推理与归档都基于该副本，
+        续训/扩列无需等待本次留证的推理和归档完成。
+        """
+        b = self._bundle
+        return ModelSnapshot(
+            model_state={k: v.detach().clone() for k, v in b.model.state_dict().items()},
+            feature_names=list(b.feature_names),
+            hidden_dim=b.hidden_dim,
+            num_classes=b.num_classes,
+            dtype=b.dtype,
+        )
 
     # ---- 训练一步 -------------------------------------------------
     def train_step(self, instances: list[dict], labels: list[int]) -> dict:

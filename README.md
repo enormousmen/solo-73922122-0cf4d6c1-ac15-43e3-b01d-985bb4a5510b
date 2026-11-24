@@ -4,27 +4,35 @@
 未改造设备仍用原有字段预测，缺失的新列自动补 0。基于 **FastAPI + CPU 版 PyTorch**
 实现的单作业（single-job）API，附带已训练的两层分类模型及**含 Adam 状态**的检查点。
 
+设备报出故障后，维修员可凭**回执号**复查当时的分类：留证预测接口在返回分类结果的
+同时归档当时的模型状态与原始读数，之后（即使续训、扩列、覆盖检查点或重启）都能
+凭号用当时的状态重新推理，复核各类概率与补零列。
+
 ## 1. 目录结构
 
 ```
 .
 ├── app/
 │   ├── model.py          # 两层分类器与扩列（零权重追加列）
-│   ├── checkpoint.py     # 检查点加载/扩列/原子保存（含 Adam 状态迁移）
+│   ├── checkpoint.py     # 检查点加载/扩列/原子保存（含 Adam 状态迁移）、留证快照与指纹
 │   ├── data.py           # 按列名对齐、缺列补 0、多余列忽略
+│   ├── receipts.py       # 回执归档/淘汰/状态去重与垃圾回收/复算受理保护
 │   ├── schemas.py        # 请求/响应模型
-│   ├── service.py        # 单作业状态、训练一步、预测、保存、重载
+│   ├── service.py        # 单作业状态、训练一步、预测、快照、保存、重载
 │   └── main.py           # FastAPI 路由与启动加载
 ├── scripts/
 │   └── train_initial.py  # 生成初始检查点（合成数据，200 步 Adam）
 ├── tests/
 │   ├── test_core.py      # 数值对照 / 扩列 / Adam 状态 / 保存失败等 9 项
-│   └── test_api.py       # HTTP 端到端 7 个用例（共 16 项断言场景）
+│   ├── test_api.py       # HTTP 端到端 7 个用例
+│   └── test_receipts.py  # 留证/复算/淘汰/去重/归档失败/受理保护等 13 项
 ├── checkpoints/
 │   └── model.pt          # 已训练检查点（4 输入 → 8 隐藏 → 3 类，含 Adam 状态）
+├── archive/              # 留证归档（回执 JSON + 模型状态 .pt），运行时生成
 ├── examples/
 │   ├── expand_api.sh     # 扩列 API 示例
-│   └── retrain_api.sh    # 续训 API 示例
+│   ├── retrain_api.sh    # 续训 API 示例
+│   └── attested_api.sh   # 留证预测 + 重启后复算演示
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -60,12 +68,32 @@
 | GET | `/health` | 健康检查 |
 | GET | `/model` | 当前列名、维度、dtype、Adam step |
 | POST | `/predict` | 预测；缺列补 0，返回标签、各类概率、补 0 列 |
+| POST | `/predict/attested` | **留证预测**：同 `/predict` 的请求格式，额外返回回执号 |
+| POST | `/receipts/{receipt_id}/replay` | **凭号复算**：用归档的权重/列顺序/精度/原始读数重新推理并对照首次结果 |
+| GET | `/receipts` | 当前保留的回执列表（按归档成功先后） |
+| GET | `/receipts/{receipt_id}` | 单张回执详情（原始读数 + 首次结果） |
 | POST | `/train` | 用一批样本**训练一步**并返回训练前后 loss |
 | POST | `/expand` | 追加一个或多个测点列（零权重 + Adam 零状态） |
 | POST | `/save` | 原子保存检查点（先写临时文件再 `os.replace`） |
 | POST | `/reload` | 从磁盘重载（模拟重启/回退），支持 query 参数 `path` |
 
 训练、扩列、保存、重载由同一把异步锁串行化；预测为只读，不阻塞。
+
+### 留证与复算设计
+
+| 需求 | 实现方式 |
+| --- | --- |
+| 留证 | 持锁克隆当前推理状态（权重/列顺序/精度）为不可变快照，锁外完成推理与归档 |
+| 不阻塞续训/扩列 | 快照取齐即释放锁；续训/扩列只等快照克隆（微秒级），不等推理和归档 |
+| 凭号复算一致 | 复算与在线预测共用同一条推理路径（`predict_with`），相同状态+相同读数逐位一致 |
+| 状态去重 | 模型状态按内容 SHA-256 指纹命名归档，多张回执共用同一状态只存一份 |
+| 只留最近 32 张 | 按归档成功先后 FIFO 淘汰（`RECEIPT_KEEP` 可调）；淘汰最后一张引用某状态的回执时清理该状态文件 |
+| 重启/覆盖检查点可复算 | 归档目录（`archive/receipts/*.json` + `archive/states/*.pt`）持久化并挂载卷；启动时扫描重建索引 |
+| 归档失败 | 留证接口返回 500 并回滚本次新写的状态文件；已有回执的复算、查询与普通预测不受影响 |
+| 受理保护 | 复算受理即对状态加活动引用；淘汰遇到活动引用时延迟清理，复算算完释放后再删 |
+
+复算响应中的 `max_probability_diff`、`labels_match`、`zero_filled_match`
+即"各类概率与首次相差不超过 1e-6、类别和补零列相同"的逐项核对结果。
 
 ### 保存与回退语义
 
@@ -80,6 +108,7 @@
 python -m venv .venv && source .venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
+pip install pytest httpx            # 仅跑测试需要
 
 python scripts/train_initial.py          # （可选）重新生成 checkpoints/model.pt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -93,8 +122,39 @@ docker compose logs -f classifier-api
 curl http://127.0.0.1:8000/model
 ```
 
-`./checkpoints` 挂载进容器，容器内保存的新版本在宿主机同目录可见。
+`./checkpoints` 与 `./archive` 挂载进容器，容器内保存的新版本与留证归档在宿主机同目录可见。
 镜像以单 uvicorn worker 运行，保证进程内只有一个活动模型。
+
+### 留证预测与重启后复算示例
+
+```bash
+bash examples/attested_api.sh
+```
+
+演示完整链路：留证预测（拿到回执号）→ 立即复算 → 续训一步 → 覆盖保存检查点
+→ `docker compose restart` 重启 → 凭旧回执号复算，脚本末尾自动校验
+`max_probability_diff <= 1e-6` 且类别/补零列一致。
+
+核心请求：
+
+```bash
+# 留证预测：请求格式与 /predict 相同，响应多出 receipt_id
+curl -X POST http://127.0.0.1:8000/predict/attested \
+  -H "Content-Type: application/json" \
+  -d '{"instances": [{"temp": 0.5, "pressure": -0.3, "rpm": 1.2, "current": 0.1}]}'
+# => {"receipt_id": "R-000001", "feature_names": [...], "predictions": [...]}
+
+# 凭号复算（续训/扩列/覆盖检查点/重启之后仍可用）
+curl -X POST http://127.0.0.1:8000/receipts/R-000001/replay
+# => {"predictions": [...], "first_predictions": [...],
+#     "max_probability_diff": 0.0, "labels_match": true, "zero_filled_match": true}
+
+# 查看当前保留的回执
+curl http://127.0.0.1:8000/receipts
+```
+
+> 注意：示例第 4 步会覆盖 `./checkpoints/model.pt`（演示"覆盖检查点"语义），
+> 该文件已被 git 跟踪，可用 `git checkout -- checkpoints/model.pt` 还原。
 
 ### 扩列示例
 
@@ -149,25 +209,33 @@ curl -X POST "http://127.0.0.1:8000/reload?path=/app/checkpoints/model_v2.pt"
 ## 7. 自测与实测结果
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -v        # 29 项
+bash scripts/run_selftest.sh      # 数值对照 + 全量测试
 ```
 
 **实测环境**：Python 3.11 / torch 2.15.0+cpu / FastAPI 0.165，float32，单线程。
 
-需求中的两处硬性数值对照（12 条随机旧样本，全量 16 个测试通过）：
+需求中的两处硬性数值对照（12 条随机旧样本，全量 29 个测试通过）：
 
 | 对照项 | 限值 | 实测最大绝对误差 |
 | --- | --- | --- |
 | 扩列后、续训前旧样本分类分数（softmax 概率） | 1e-6 | **0.000e+00** |
 | 同批旧样本各训一步后的原参数（4 个张量） | 1e-6 | **0.000e+00** |
 | 同上，对应 Adam 的 `exp_avg`/`exp_avg_sq`/`step` | 1e-6 | **0.000e+00** |
+| 留证复算与首次的各类概率（含续训/扩列/覆盖检查点/重启后） | 1e-6 | **0.000e+00** |
 
 其他实测结论：
 
 - 新列零初始化；仅喂旧字段训练一步后新列权重仍为 0；带 `vibration` 读数训练后新列权重变为非零。
 - 保存到非法路径返回 500，原 `model.pt` 可重新加载、服务预测不受影响。
 - 保存 → 重载（等价重启）→ 旧字段预测正常（补 0 列正确回显）→ 按新列续训，Adam step 正确递增（201→202→203）。
-- 重名列、空扩列、越界标签、样本/标签数量不一致均返回 422。
+- 留证 → 续训 → 覆盖检查点 → **真实进程重启**（uvicorn 重起，重新加载覆盖后的检查点，step=201）→ 凭旧回执号复算：`max_probability_diff = 0.0`，类别/补零列一致。
+- 回执淘汰：`RECEIPT_KEEP=3` 时连续留证 5 张，仅最近 3 张可复算/查询，最旧 2 张 404；未续训时 5 张回执共用 1 份状态文件。
+- 状态垃圾回收：`keep=2` 且每轮续训改变状态，淘汰最后一张引用某状态的回执后对应 `.pt` 文件被删除，磁盘上始终只保留被引用状态。
+- 归档失败（回执目标路径被占位为目录）：留证返回 500，本次新写状态文件回滚干净，已有回执复算/查询与普通预测均正常。
+- 受理保护（store 级）：复算受理后淘汰该回执，状态文件保留至复算算完（结果与首次逐位一致），释放引用后才清理。
+- 不阻塞验证：人为将归档拖慢 0.5s，留证请求进行中续训/扩列取锁等待 < 0.3s（只等快照克隆）。
+- 重名列、空扩列、越界标签、样本/标签数量不一致、空留证样本均返回 422。
 
 ## 8. 已实现功能与未完成项
 
@@ -179,12 +247,19 @@ python -m pytest tests/ -v
 - 追加测点列（支持一次多列、重名拒绝），零权重 + Adam 零状态迁移
 - 扩列前后旧样本分数、续训一步后原参数与 Adam 状态逐位一致（误差 0 ≤ 1e-6）
 - 带新读数样本可更新新增权重；检查点原子保存、失败保护、重载恢复
-- Dockerfile + docker-compose（单 worker、检查点卷挂载、健康检查）
-- 扩列/续训 API shell 示例与 16 项自动化测试
+- **留证预测**：返回分类结果 + 回执号；快照在锁内取齐，推理与归档在锁外，不阻塞续训/扩列
+- **凭号复算**：用归档的权重/列顺序/精度/原始读数重新推理，响应内置与首次结果的逐项对照
+- 回执按归档成功先后保留最近 32 张（`RECEIPT_KEEP` 可调）；模型状态按内容指纹去重归档，
+  最后一张引用它的回执淘汰时清理；归档目录持久化，覆盖检查点/重启后仍可复算
+- 归档失败报错并回滚，已有回执照常可用；已受理复算遇淘汰仍算完（活动引用延迟清理）
+- Dockerfile + docker-compose（单 worker、检查点与归档卷挂载、健康检查）
+- 扩列/续训/留证复算 API shell 示例与 29 项自动化测试
 
 **未完成 / 边界说明**
 
-- 当前环境未安装 Docker，**镜像未在本机实际构建运行**；Dockerfile/compose 已按 CPU wheel 与单作业要求编写，需在有 Docker 的环境执行 `docker compose up -d --build` 验证。
-- 训练接口固定为“每请求一步”的小批量增量训练，未实现多 epoch 调度、学习率调度器与早停。
+- 当前环境未安装 Docker，**镜像未在本机实际构建运行**；Dockerfile/compose 已按 CPU wheel 与单作业要求编写，需在有 Docker 的环境执行 `docker compose up -d --build` 验证（`examples/attested_api.sh` 的重启步骤依赖 docker compose）。
+- 复算的逐位一致以**同一 torch 版本/同一 CPU 指令路径**为前提（容器镜像固定依赖版本）；跨版本复算不保证逐位一致，但概率差预计仍远小于 1e-6 的量级需重新实测。
+- 训练接口固定为"每请求一步"的小批量增量训练，未实现多 epoch 调度、学习率调度器与早停。
 - 未接入鉴权/限流与多作业并发；服务按单作业设计，写操作由进程内锁串行化。
+- 回执保留策略为整体 FIFO（按归档成功先后），不支持按回执单独置顶/续期；归档目录无容量配额，仅按张数淘汰。
 - 合成数据仅用于演示与数值核对；接入真实产线数据时需替换 `scripts/train_initial.py` 的数据来源并重新标定类别。
